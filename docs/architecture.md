@@ -11,7 +11,7 @@ RGB is a client-side validation protocol. Asset state is not held on-chain or in
 RGB20 balances are bound to specific Bitcoin UTXOs. A maker holding `N` units of an asset does not hold a fungible pool — it holds a set of UTXOs, each carrying an allocation. Quoting and settlement must reason at the UTXO level:
 
 - a quote implicitly commits a specific UTXO (or set of UTXOs) to a potential trade
-- two concurrent quotes against overlapping UTXOs cannot both settle
+- two concurrent quotes against overlapping UTXOs cannot both settle independently (combining them into a single transaction is technically possible but is an explicit routing decision, not a default)
 - inventory state is the set of `(outpoint, asset_id, allocation)` tuples, not a scalar balance
 
 This forces the maker node to track reservations per UTXO and to release them on quote expiry or rejection.
@@ -30,6 +30,20 @@ A successful RGB transfer produces two artifacts:
 - a consignment, an off-chain bundle containing the state transition history the receiver needs to validate the new allocation
 
 The receiver validates the consignment against its own RGB stash. If validation fails, the receiver does not credit the asset, regardless of what happened on-chain. This means consignment delivery is part of settlement, not a post-settlement step. The maker node is responsible for producing the consignment and ensuring it reaches the taker.
+
+This ordering matters operationally. If consignment delivery fails *after* the PSBT has been broadcast, the chain has advanced but the receiver cannot validate the new allocation — funds are not lost (the maker can re-deliver the consignment) but the receiver is in a stuck state until delivery succeeds. The maker node must therefore complete consignment delivery before broadcasting whenever possible, and any delivery transport must be retriable for cases where re-delivery is the only remaining option.
+
+## Settlement Scope
+
+V1 of RGB RFQ Network targets **on-chain RGB20 settlement only**, built on the [rgb-lib](https://github.com/RGB-Tools/rgb-lib) v0.11 stash and state-transition APIs. Lightning RGB settlement, via [rgb-lightning-node](https://github.com/RGB-Tools/rgb-lightning-node), is documented as future work in [milestones.md](milestones.md) and is not part of the funded grant scope.
+
+The on-chain-first decision is deliberate:
+
+- Wallet-to-LP, lending, and OTC flows that the RGB ecosystem needs today are on-chain. These are the integrations the protocol must serve in v1.
+- Lightning RGB is still maturing. rgb-lightning-node has its own evolving channel and HTLC semantics; coupling v1 settlement to that surface would import that flux into the broker and client SDK.
+- A narrower v1 scope keeps the trust model and the threat surface small enough to ship and audit within the grant window.
+
+The architecture is shaped to make a Lightning adapter an addition rather than a rewrite. The settlement engine inside the maker node is a trait boundary; the on-chain implementation is one realization of that trait, and a Lightning realization can be added later without touching the broker, the client SDK, or the protocol surface.
 
 ## Maker Node Architecture
 
@@ -73,7 +87,7 @@ When the quoting engine produces a quote, it places a soft reservation on the UT
 - are released on explicit rejection or timeout
 - block other quotes from committing to the same UTXOs
 
-This prevents the common failure mode where a maker hands out two quotes against the same inventory and can only honor one. Reservations are local state — they are not synchronized across maker nodes, since each maker controls its own UTXO set.
+This prevents the common failure mode where a maker hands out two quotes against the same inventory and can only honor one. Reservations are local state — they are not synchronized across maker nodes, since each maker controls its own UTXO set. Cross-maker reservation state is never shared; any future broker-side coordination (Milestone 4) operates on broker-held fanout hints, not on maker-internal reservation tables.
 
 ### Settlement Engine
 
@@ -88,6 +102,26 @@ On quote acceptance, the settlement engine:
 7. signs and broadcasts the PSBT
 
 Consignment delivery precedes broadcast. If delivery fails, the maker can abort before committing the Bitcoin transaction, avoiding the case where the chain advances but the receiver cannot validate.
+
+## Privacy Properties
+
+The system is designed so that the broker sees only the minimum needed to route an RFQ, and the on-chain footprint of a settled trade carries no asset semantics for an external observer.
+
+| Field | Broker | Maker | External (chain/network) observer |
+|---|---|---|---|
+| RFQ payload (asset ID, amount, side) | Sees — required to route | Sees — required to quote | Does not see |
+| Taker network identity | Pseudonymous session ID only | Not directly visible (broker-mediated) | Does not see |
+| Taker UTXO (the unblinded outpoint) | Does not see (blinded by invoice) | Does not see — only the blinded seal commitment | Does not see |
+| Maker source UTXOs | Not in any protocol message — the PSBT is built, signed, and broadcast directly by the maker, not relayed through the broker. Timing correlation against on-chain activity remains a residual leak. | Self | Sees on-chain after broadcast (as ordinary Bitcoin inputs) |
+| Consignment payload | Does not see (delivered out-of-band by direct transport) | Produces it | Does not see |
+| Post-settlement linkability | Knows that RFQ X led to acceptance Y | Knows its own counterparty for that trade | Sees a Bitcoin transaction; cannot determine it carried RGB state without out-of-band information |
+
+Two consequences worth flagging:
+
+- **A malicious broker is bounded.** A broker cannot move assets, forge state, or learn the taker's UTXO. It can deny service, log RFQs, and observe routing patterns. The protocol does not assume a single broker; multiple independent brokers can coexist.
+- **Maker selection is the taker's privacy decision.** Choosing which maker to trade with reveals the taker's blinded seal to that maker at settlement. Takers should treat maker selection the same way they treat counterparty selection in any direct trade.
+
+A more complete threat model is in [threat-model.md](threat-model.md).
 
 ## Why RFQ Fits RGB Better Than Orderbooks Initially
 
